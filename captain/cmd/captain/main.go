@@ -1,0 +1,501 @@
+// Copyright (c) The Arribada initiative.
+// Licensed under the GPLv3 License.
+
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	diskfs "github.com/diskfs/go-diskfs"
+	"github.com/diskfs/go-diskfs/backend/file"
+	"github.com/diskfs/go-diskfs/partition/gpt"
+	"golang.org/x/sys/unix"
+)
+
+var (
+	flagHost         string
+	flagDevice       string
+	flagLabel        string
+	flagMount        string
+	flagForce        bool
+	flagAllowFormat  bool
+	flagTempInterval int
+)
+
+func init() {
+	flag.StringVar(&flagHost, "host", ":7143", "host:port on which we listen")
+	flag.StringVar(&flagDevice, "device", "", "the path to the device that is going to be formatted. ex: /dev/sda")
+	flag.StringVar(&flagLabel, "label", "MARLIN_DATA", "the volume label set on the filesystem at the very last stage of the device preparation. Serves as a sentinel for subsequent runs.")
+	flag.StringVar(&flagMount, "mnt", "", "the mount point for the drive. empty means no mounting.")
+	flag.BoolVar(&flagForce, "force", false, "Skip all checks and force prep the drive (also overrides -format).")
+	flag.BoolVar(&flagAllowFormat, "format", false, "Whether we are allowed to actually format the drive if needed.")
+	flag.IntVar(&flagTempInterval, "temp_interval", 20, "Interval in seconds between each temperature check. Disabled if not positive.")
+}
+
+const (
+	maxFATLabelSize = 11
+	// TODO: use fsck from busybox instead? Given that the mkfs one is
+	// bugged, we want to be careful about fsck as well.
+	fsckbin = "/usr/local/bin/fsck.fat"
+	mkfsbin = "/usr/local/bin/mkfs.fat"
+)
+
+func checkFlags() {
+	if flagHost == "" {
+		log.Fatalf("-host cannot be empty")
+	}
+
+	if flagDevice == "" {
+		log.Fatalf("-device must be provided")
+	}
+
+	if flagLabel == "" {
+		log.Fatalf("-label cannot be empty")
+	}
+
+	if len(flagLabel) > maxFATLabelSize {
+		log.Fatalf("-label value too long (> %d chars)", len(flagLabel))
+	}
+}
+
+var (
+	prepMu  sync.RWMutex
+	prepped bool
+	prepErr error
+)
+
+func main() {
+	flag.Parse()
+
+	checkFlags()
+
+	if flagForce {
+		flagAllowFormat = true
+		log.Printf("Force prepping the drive now.")
+		if err := prepSSD(flagLabel, flagDevice); err != nil {
+			log.Fatalf("while preparing drive: %v", err)
+		}
+		os.Exit(0)
+	}
+
+	monitorTemperature(context.Background())
+
+	go func() {
+		var device string
+		var err error
+		pause := time.Second
+		maxPause := 5 * time.Minute
+		// force a reboot if the device is not found after a few times, as
+		// it might indeed just have not been enumerated by kernel, which does
+		// happen sometimes.
+		tries := 0
+		maxTries := 7
+		for {
+			device, err = findDevice(flagDevice)
+			prepMu.Lock()
+			prepErr = err
+			prepMu.Unlock()
+			if err == nil {
+				log.Printf("device found: %s", device)
+				break
+			}
+			log.Printf("while trying to find device: %v", err)
+			tries++
+			if tries >= maxTries {
+				reboot()
+				return
+			}
+			time.Sleep(pause)
+			pause *= 2
+			if pause > maxPause {
+				pause = maxPause
+			}
+		}
+
+		pause = time.Second
+		maxPause = 5 * time.Minute
+		for {
+			err := checkAndPrep(device, flagLabel)
+			prepMu.Lock()
+			prepErr = err
+			prepMu.Unlock()
+			if err == nil {
+				log.Printf("SSD at %v ready", flagDevice)
+				break
+			}
+			log.Printf("%v", err.Error())
+			time.Sleep(pause)
+			pause *= 2
+			if pause > maxPause {
+				pause = maxPause
+			}
+		}
+
+		if flagMount == "" {
+			log.Printf("No mounting as -mnt not provided")
+			return
+		}
+
+		pause = time.Second
+		maxPause = 5 * time.Minute
+		for {
+			part, err := partitionName(device)
+			if err == nil {
+				err = mount(part, flagMount)
+			}
+			prepMu.Lock()
+			prepErr = err
+			if err == nil {
+				prepped = true
+			}
+			prepMu.Unlock()
+			if err == nil {
+				log.Printf("Drive mounted at %v", flagMount)
+				break
+			}
+			log.Printf("%v", err.Error())
+			time.Sleep(pause)
+			pause *= 2
+			if pause > maxPause {
+				pause = maxPause
+			}
+		}
+		listenForSignals()
+	}()
+
+	dp := new(DrivePrepper)
+	rpc.Register(dp)
+	rpc.HandleHTTP()
+	l, err := net.Listen("tcp", flagHost)
+	if err != nil {
+		log.Fatal("listen error:", err)
+	}
+	http.Serve(l, nil)
+}
+
+func listenForSignals() {
+	if flagMount == "" {
+		return
+	}
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, unix.SIGTERM)
+	go func() {
+		for sig := range c {
+			log.Printf("received signal %s, cleaning up", sig)
+
+			switch sig {
+			case unix.SIGTERM:
+				log.Printf("Unmounting %v", flagMount)
+				// TODO: use unix.MNT_DETACH?
+				if err := syscall.Unmount(flagMount, 0); err != nil {
+					log.Printf("unmounting %v failed: %v", flagMount, err)
+				}
+				os.Exit(0)
+			}
+		}
+	}()
+}
+
+type DrivePrepper struct{}
+
+// IsReady checks whether the drive is done being prepared.
+// reply == "ready" -> all good
+// reply != "" -> critical error
+// reply == "" -> no error, but drive not ready yet.
+func (p *DrivePrepper) IsReady(noop int, reply *string) error {
+	prepMu.RLock()
+	isReady := prepped
+	err := prepErr
+	prepMu.RUnlock()
+	if err != nil {
+		*reply = err.Error()
+		return nil
+	}
+	if isReady {
+		*reply = "ready"
+		return nil
+	}
+	*reply = ""
+	return nil
+}
+
+func findBlockDevices() ([]string, error) {
+	dir, err := os.ReadDir("/sys/block")
+	if err != nil {
+		return nil, err
+	}
+	var entries []string
+	for _, v := range dir {
+		entries = append(entries, filepath.Join("/dev", v.Name()))
+	}
+	return entries, nil
+}
+
+func findDevice(device string) (string, error) {
+	devices, err := findBlockDevices()
+	if err != nil {
+		return "", err
+	}
+
+	for _, v := range devices {
+		if v == device {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("%v not found among existing block devices", device)
+}
+
+// TODO: do we always assume partition one?
+func partitionName(device string) (string, error) {
+	// TODO: find it dynamically in existing ones
+	if strings.HasPrefix(device, "/dev/sd") {
+		return device + "1", nil
+	}
+	if strings.HasPrefix(device, "/dev/nvme") {
+		return device + "p1", nil
+	}
+	return "", fmt.Errorf("unexpected device: %v", device)
+}
+
+func fsck(part string) ([]byte, error) {
+	// Looks like -a does the writing, so we indeed don't need -w.
+	// AFAIU, -a waits for the whole thing to be done before writing
+	// everything, while -w write things ASAP.
+	cmd := exec.Command(fsckbin, "-v", "-a", "-V", part)
+	//	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	//	return cmd.Run()
+	out, err := cmd.Output()
+	fmt.Fprintf(os.Stdout, "%s", string(out))
+	return out, err
+}
+
+// checkFS runs fsck, and then returns whether the filesystem has any files.
+func checkFS(part string) (bool, error) {
+	var out []byte
+	var err error
+	if out, err = fsck(part); err != nil {
+		// we know we'll get an exit code == 1 if there were things to correct,
+		// even if the fixes succeeded. so we do the brute/simple thing, and we
+		// simply retry once more. If things were corrected, the second run
+		// should return 0. If not, then we do have an actual problem and we
+		// let the caller deal with it.
+		if out, err = fsck(part); err != nil {
+			return false, fmt.Errorf("while trying to fsck %v: %v", part, err)
+		}
+	}
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	nbFiles := -1
+	for sc.Scan() {
+		l := sc.Text()
+		if !strings.Contains(l, "files,") || !strings.HasSuffix(l, "clusters") {
+			continue
+		}
+		parts := strings.SplitN(l, " ", 5)
+		if len(parts) != 5 {
+			return false, fmt.Errorf("unexpected number of parts: %d", len(parts))
+		}
+		nb, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return false, fmt.Errorf("could not parse %s as a number of files", parts[1])
+		}
+		nbFiles = nb
+		break
+	}
+	if nbFiles < 0 {
+		return false, errors.New("could not figure out whether the filesystem has any files")
+	}
+	// technically the test should be > 0 , but turns out even when fs seems empty,
+	// fsck says 1 file.
+	// And that is because of the volume label itself I think.
+	if nbFiles > 1 {
+		return true, sc.Err()
+	}
+	return false, sc.Err()
+}
+
+func checkAndPrep(device, label string) error {
+	hasFiles, needsPrep, err := check(device, label)
+	if err != nil {
+		return fmt.Errorf("while trying to check device: %v", err)
+	}
+
+	if !needsPrep {
+		log.Printf("SSD was already prepped, nothing to do")
+		return nil
+	}
+
+	if hasFiles {
+		return fmt.Errorf("Volume label hints that we should partition/format, but device actually already has files, so refusing to proceed")
+	}
+
+	log.Printf("SSD needs partitionning and/or formatting, proceeding.")
+	if err := prepSSD(label, device); err != nil {
+		return fmt.Errorf("while preparing drive: %v", err)
+	}
+	return nil
+}
+
+// returns error on critical problem. otherwise returns whether the drive needs to be prepped again.
+// TODO: simplify it all, remove needsPrep...
+func check(device, label string) (hasFiles, needsPrep bool, err error) {
+	theBackend, err := file.OpenFromPath(device, true)
+	if err != nil {
+		return false, false, err
+	}
+
+	theDisk, err := diskfs.OpenBackend(theBackend)
+	if err != nil {
+		return false, false, err
+	}
+
+	part, err := partitionName(device)
+	if err != nil {
+		return false, false, err
+	}
+	hasFiles, err = checkFS(part)
+	if err != nil {
+		return hasFiles, false, err
+	}
+
+	// TODO: is it bad to assume we're always going to use the first partition?
+	// TODO: replace this (and all the diskfs stuff anyway with more reliable dosfs stuff)
+	fs, err := theDisk.GetFilesystem(1)
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "unknown filesystem") {
+			return hasFiles, false, err
+		}
+		// TODO: could it fail for other reasons?
+		log.Printf("no existing filesystem found on device: %v", err)
+		return hasFiles, true, nil
+	}
+
+	lbl := fs.Label()
+	if lbl == "" {
+		log.Printf("existing filesystem was found, but with no label")
+		return hasFiles, true, nil
+	}
+	// Should never happen, but can't hurt.
+	if len(lbl) > maxFATLabelSize {
+		return hasFiles, false, fmt.Errorf("label on filesystem (%v) longer than max allowed size (%d)", lbl, maxFATLabelSize)
+	}
+	if lbl != label {
+		log.Printf("existing filesystem was found, but with wrong label (%v)", lbl)
+		return hasFiles, true, nil
+	}
+
+	return hasFiles, false, nil
+}
+
+func mkfs(part, label string) error {
+	cmd := exec.Command(mkfsbin, "-n", label, part)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+const (
+	partName           = "marlin"
+	sectorSize         = 512
+	physicalSectorSize = 4096
+	// could be as low as 34 really, because GPT headers are 33 sectors,
+	// but using 40 for alignment reasons (factor of 8)
+	startSector = 40
+)
+
+func prepSSD(label, device string) error {
+	if !flagAllowFormat {
+		return errors.New("aborting prepping the drive since it has not been explictly allowed")
+	}
+	theBackend, err := file.OpenFromPath(device, false)
+	if err != nil {
+		return err
+	}
+
+	theDisk, err := diskfs.OpenBackend(theBackend)
+	if err != nil {
+		return err
+	}
+
+	sizeInSectors := uint64(theDisk.Size) / uint64(sectorSize)
+	sizeInSectors -= uint64(startSector)
+	sizeInSectors -= 33 // leave space for backup GPT at the end
+
+	part := gpt.Partition{
+		Start: uint64(startSector),
+		Size:  sizeInSectors * uint64(sectorSize),
+		Type:  gpt.MicrosoftBasicData,
+		// Type: gpt.EFISystemPartition,
+		Name: partName,
+	}
+
+	table := gpt.Table{
+		Partitions: []*gpt.Partition{
+			&part,
+		},
+		LogicalSectorSize:  sectorSize,
+		PhysicalSectorSize: physicalSectorSize,
+		ProtectiveMBR:      true, // to comply with systems that do not support GPT
+	}
+
+	if err := theDisk.Partition(&table); err != nil {
+		return err
+	}
+
+	log.Printf("Creating filesystem with label %s", label)
+	// TODO: something goes wrong with the bit below, as fsck is not
+	// (always, depends on the disk size?) happy about it. So we use mkfs
+	// instead for now. It would be nice if we could stop depending on
+	// mkfs though.
+	/*
+		theFS, err := theDisk.CreateFilesystem(disk.FilesystemSpec{
+			Partition:   1,
+			FSType:      filesystem.TypeFat32,
+			VolumeLabel: label,
+		})
+		if err != nil {
+			return err
+		}
+		if err := theFS.SetLabel(label); err != nil {
+			return err
+		}
+	*/
+
+	if err := theDisk.Close(); err != nil {
+		log.Printf("while closing the disk: %v", err)
+	}
+
+	p, err := partitionName(device)
+	if err != nil {
+		return err
+	}
+
+	time.Sleep(time.Second)
+
+	// recreating with mkfs anyway, because something is going wrong with the above.
+	// Also, we're not using busybox's mkfs because its -n option produces a broken label,
+	// see https://github.com/dosfstools/dosfstools/issues/172
+	if err = mkfs(p, label); err != nil {
+		return fmt.Errorf("while trying to mkfs %v: %v", part, err)
+	}
+
+	return nil
+}
